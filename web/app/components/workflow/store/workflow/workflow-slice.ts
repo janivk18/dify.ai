@@ -1,0 +1,133 @@
+import type { UploadConfig } from '@dify/contracts/api/console/files/types.gen'
+import type { StateCreator } from 'zustand'
+import type {
+  Edge,
+  Node,
+  TriggerNodeType,
+  WorkflowRunningData,
+} from '@/app/components/workflow/types'
+
+type PreviewRunningData = WorkflowRunningData & {
+  resultTabActive?: boolean
+  resultText?: string
+  resultTextSelectorKey?: string
+  // separated-mode reasoning deltas per LLM node id (live preview only)
+  reasoningContent?: Record<string, string>
+  // true once the terminal reasoning marker arrived
+  reasoningFinished?: boolean
+  // human input form schema or data cached when node is in 'Paused' status
+  extraContentAndFormData?: Record<string, unknown>
+}
+
+export type WorkflowSliceShape = {
+  workflowRunningData?: PreviewRunningData
+  setWorkflowRunningData: (workflowData: PreviewRunningData) => void
+  isListening: boolean
+  setIsListening: (listening: boolean) => void
+  canvasReadOnly: boolean
+  setCanvasReadOnly: (readOnly: boolean) => void
+  listeningTriggerType: TriggerNodeType | null
+  setListeningTriggerType: (triggerType: TriggerNodeType | null) => void
+  listeningTriggerNodeId: string | null
+  setListeningTriggerNodeId: (nodeId: string | null) => void
+  listeningTriggerNodeIds: string[]
+  setListeningTriggerNodeIds: (nodeIds: string[]) => void
+  listeningTriggerIsAll: boolean
+  setListeningTriggerIsAll: (isAll: boolean) => void
+  clipboardElements: Node[]
+  clipboardEdges: Edge[]
+  setClipboardElements: (clipboardElements: Node[]) => void
+  setClipboardEdges: (clipboardEdges: Edge[]) => void
+  setClipboardData: (clipboardData: { nodes: Node[]; edges: Edge[] }) => void
+  selection: null | { x1: number; y1: number; x2: number; y2: number }
+  setSelection: (selection: WorkflowSliceShape['selection']) => void
+  bundleNodeSize: { width: number; height: number } | null
+  setBundleNodeSize: (bundleNodeSize: WorkflowSliceShape['bundleNodeSize']) => void
+  controlMode: 'pointer' | 'hand' | 'comment'
+  setControlMode: (controlMode: WorkflowSliceShape['controlMode']) => void
+  /** A new comment's place on the canvas, in flow coordinates, while it is written. */
+  pendingComment: { x: number; y: number } | null
+  setPendingComment: (pendingComment: WorkflowSliceShape['pendingComment']) => void
+  isCommentPlacing: boolean
+  setCommentPlacing: (isCommentPlacing: boolean) => void
+  isCommentQuickAdd: boolean
+  setCommentQuickAdd: (isCommentQuickAdd: boolean) => void
+  isCommentPreviewHovering: boolean
+  setCommentPreviewHovering: (hovering: boolean) => void
+  mousePosition: { pageX: number; pageY: number; elementX: number; elementY: number }
+  setMousePosition: (mousePosition: WorkflowSliceShape['mousePosition']) => void
+  showConfirm?: { title: string; desc?: string; onConfirm: () => void; onCancel?: () => void }
+  setShowConfirm: (showConfirm: WorkflowSliceShape['showConfirm']) => void
+  controlPromptEditorRerenderKey: number
+  setControlPromptEditorRerenderKey: (controlPromptEditorRerenderKey: number) => void
+  showImportDSLModal: boolean
+  setShowImportDSLModal: (showImportDSLModal: boolean) => void
+  fileUploadConfig?: UploadConfig
+  setFileUploadConfig: (fileUploadConfig: UploadConfig) => void
+}
+
+export const createWorkflowSlice: StateCreator<WorkflowSliceShape> = (set) => ({
+  workflowRunningData: undefined,
+  setWorkflowRunningData: (workflowRunningData) => set(() => ({ workflowRunningData })),
+  isListening: false,
+  setIsListening: (listening) => set(() => ({ isListening: listening })),
+  canvasReadOnly: false,
+  setCanvasReadOnly: (canvasReadOnly) => set(() => ({ canvasReadOnly })),
+  listeningTriggerType: null,
+  setListeningTriggerType: (triggerType) => set(() => ({ listeningTriggerType: triggerType })),
+  listeningTriggerNodeId: null,
+  setListeningTriggerNodeId: (nodeId) => set(() => ({ listeningTriggerNodeId: nodeId })),
+  listeningTriggerNodeIds: [],
+  setListeningTriggerNodeIds: (nodeIds) => set(() => ({ listeningTriggerNodeIds: nodeIds })),
+  listeningTriggerIsAll: false,
+  setListeningTriggerIsAll: (isAll) => set(() => ({ listeningTriggerIsAll: isAll })),
+  clipboardElements: [],
+  clipboardEdges: [],
+  setClipboardElements: (clipboardElements) => set(() => ({ clipboardElements })),
+  setClipboardEdges: (clipboardEdges) => set(() => ({ clipboardEdges })),
+  setClipboardData: ({ nodes, edges }) => {
+    set(() => ({
+      clipboardElements: nodes,
+      clipboardEdges: edges,
+    }))
+  },
+  selection: null,
+  setSelection: (selection) => set(() => ({ selection })),
+  bundleNodeSize: null,
+  setBundleNodeSize: (bundleNodeSize) => set(() => ({ bundleNodeSize })),
+  controlMode: 'pointer',
+  // A draft comment belongs to comment mode, unless a quick add started it.
+  setControlMode: (controlMode) =>
+    set((state) => ({
+      controlMode,
+      ...(controlMode !== 'comment' && !state.isCommentQuickAdd && { pendingComment: null }),
+    })),
+  pendingComment: null,
+  // A quick add ends with its draft, unless it is still placing one.
+  setPendingComment: (pendingComment) =>
+    set((state) => ({
+      pendingComment,
+      ...(!pendingComment && !state.isCommentPlacing && { isCommentQuickAdd: false }),
+    })),
+  isCommentPlacing: false,
+  setCommentPlacing: (isCommentPlacing) =>
+    set((state) => ({
+      isCommentPlacing,
+      ...(!isCommentPlacing && !state.pendingComment && { isCommentQuickAdd: false }),
+    })),
+  isCommentQuickAdd: false,
+  setCommentQuickAdd: (isCommentQuickAdd) => set(() => ({ isCommentQuickAdd })),
+  mousePosition: { pageX: 0, pageY: 0, elementX: 0, elementY: 0 },
+  setMousePosition: (mousePosition) => set(() => ({ mousePosition })),
+  isCommentPreviewHovering: false,
+  setCommentPreviewHovering: (hovering) => set(() => ({ isCommentPreviewHovering: hovering })),
+  showConfirm: undefined,
+  setShowConfirm: (showConfirm) => set(() => ({ showConfirm })),
+  controlPromptEditorRerenderKey: 0,
+  setControlPromptEditorRerenderKey: (controlPromptEditorRerenderKey) =>
+    set(() => ({ controlPromptEditorRerenderKey })),
+  showImportDSLModal: false,
+  setShowImportDSLModal: (showImportDSLModal) => set(() => ({ showImportDSLModal })),
+  fileUploadConfig: undefined,
+  setFileUploadConfig: (fileUploadConfig) => set(() => ({ fileUploadConfig })),
+})

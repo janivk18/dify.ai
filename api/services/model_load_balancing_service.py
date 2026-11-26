@@ -1,0 +1,791 @@
+import contextlib
+import logging
+from collections.abc import Callable, Mapping
+from typing import Protocol, TypedDict
+
+from pydantic import ConfigDict, RootModel, ValidationError
+from sqlalchemy import or_, select
+from sqlalchemy.orm import Session
+
+from constants import HIDDEN_VALUE
+from core.entities.provider_configuration import ProviderConfiguration
+from core.helper import encrypter
+from core.helper.model_provider_cache import (
+    ProviderCredentialsCache,
+    ProviderCredentialsCacheType,
+)
+from core.model_manager import LBModelManager
+from core.plugin.impl.model_runtime_factory import (
+    PluginModelAssembly,
+    create_plugin_model_assembly,
+    create_plugin_provider_manager,
+)
+from core.provider_manager import ProviderConfigurationCacheSource, ProviderManager
+from graphon.model_runtime.entities.model_entities import ModelType
+from graphon.model_runtime.entities.provider_entities import (
+    CredentialFormSchema,
+    ModelCredentialSchema,
+    ProviderCredentialSchema,
+)
+from graphon.model_runtime.model_providers.model_provider_factory import ModelProviderFactory
+from libs.datetime_utils import naive_utc_now
+from models.enums import CredentialSourceType
+from models.provider import LoadBalancingModelConfig, ProviderCredential, ProviderModelCredential
+
+logger = logging.getLogger(__name__)
+
+
+class LoadBalancingCredentials(RootModel[dict[str, str | bool]]):
+    """Provider-defined credentials for one load-balancing config.
+
+    Keys come from the provider or model credential schema, not from this service.
+    Text, secret, select, and radio fields are strings. Switch fields are booleans.
+    That is the mapping graphon's credential validator produces (``dict[str, str | bool]``).
+    Strict mode keeps JSON numbers from being coerced into booleans.
+    """
+
+    model_config = ConfigDict(strict=True)
+
+    def string_value(self, key: str) -> str | None:
+        """Return a text or secret field. Switch booleans are not strings."""
+        value = self.root.get(key)
+        if isinstance(value, str):
+            return value
+        return None
+
+    def set(self, key: str, value: str | bool) -> None:
+        self.root[key] = value
+
+
+def _decode_encrypted_config(encrypted_config: str | None) -> LoadBalancingCredentials:
+    """Decode a stored load balancing ``encrypted_config``.
+
+    Missing, malformed, non-object, and non ``str | bool`` payloads all decode to empty
+    credentials so that one corrupted row cannot break listing or editing the other configs.
+    """
+    if not encrypted_config:
+        return LoadBalancingCredentials({})
+    try:
+        return LoadBalancingCredentials.model_validate_json(encrypted_config)
+    except ValidationError:
+        return LoadBalancingCredentials({})
+
+
+type LoadBalancingCredentialInput = LoadBalancingCredentials | Mapping[str, str | bool]
+
+
+class LoadBalancingTokenCipher(Protocol):
+    """Encrypts and decrypts secret credential values for one tenant."""
+
+    def encrypt_token(self, tenant_id: str, token: str) -> str: ...
+
+    def decrypt_token(self, tenant_id: str, token: str) -> str: ...
+
+
+class _EncrypterTokenCipher:
+    def __init__(
+        self,
+        encrypt_token: Callable[[str, str], str] = encrypter.encrypt_token,
+        decrypt_token: Callable[[str, str], str] = encrypter.decrypt_token,
+    ) -> None:
+        self._encrypt_token = encrypt_token
+        self._decrypt_token = decrypt_token
+
+    def encrypt_token(self, tenant_id: str, token: str) -> str:
+        return self._encrypt_token(tenant_id, token)
+
+    def decrypt_token(self, tenant_id: str, token: str) -> str:
+        return self._decrypt_token(tenant_id, token)
+
+
+def encrypter_token_cipher(
+    encrypt_token: Callable[[str, str], str] = encrypter.encrypt_token,
+    decrypt_token: Callable[[str, str], str] = encrypter.decrypt_token,
+) -> LoadBalancingTokenCipher:
+    """Build the production cipher, optionally with different encrypt and decrypt functions."""
+    return _EncrypterTokenCipher(encrypt_token=encrypt_token, decrypt_token=decrypt_token)
+
+
+_DEFAULT_TOKEN_CIPHER = encrypter_token_cipher()
+
+
+def _parse_submitted_credentials(raw: LoadBalancingCredentialInput) -> LoadBalancingCredentials:
+    """Parse credentials submitted by a caller into :class:`LoadBalancingCredentials`.
+
+    Already-parsed values are copied. Anything that is not a ``str | bool`` mapping is rejected.
+    """
+    if isinstance(raw, LoadBalancingCredentials):
+        return LoadBalancingCredentials.model_validate(dict(raw.root))
+    try:
+        return LoadBalancingCredentials.model_validate(raw)
+    except ValidationError as exc:
+        raise ValueError("Invalid load balancing config credentials") from exc
+
+
+def _obfuscated_credentials(
+    provider_configuration: ProviderConfiguration,
+    credentials: LoadBalancingCredentials,
+    credential_form_schemas: list[CredentialFormSchema],
+) -> dict[str, str | bool]:
+    """Mask secret fields and parse the obfuscated mapping back into the credential shape."""
+    obfuscated = provider_configuration.obfuscated_credentials(
+        credentials=dict(credentials.root),
+        credential_form_schemas=credential_form_schemas,
+    )
+    return LoadBalancingCredentials.model_validate(obfuscated).root
+
+
+class LoadBalancingConfigDetailDict(TypedDict):
+    id: str
+    name: str
+    credentials: dict[str, str | bool]
+    enabled: bool
+
+
+class LoadBalancingConfigSummaryDict(TypedDict):
+    id: str
+    name: str
+    credentials: dict[str, str | bool]
+    credential_id: str | None
+    enabled: bool
+    in_cooldown: bool
+    ttl: int
+
+
+class ModelLoadBalancingService:
+    @staticmethod
+    def _get_provider_manager(tenant_id: str) -> ProviderManager:
+        return create_plugin_provider_manager(tenant_id=tenant_id)
+
+    def enable_model_load_balancing(self, tenant_id: str, provider: str, model: str, model_type: str):
+        """
+        enable model load balancing.
+
+        :param tenant_id: workspace id
+        :param provider: provider name
+        :param model: model name
+        :param model_type: model type
+        :return:
+        """
+        # Get all provider configurations of the current workspace
+        provider_configurations = self._get_provider_manager(tenant_id).get_configurations(tenant_id)
+
+        # Get provider configuration
+        provider_configuration = provider_configurations.get(provider)
+        if not provider_configuration:
+            raise ValueError(f"Provider {provider} does not exist.")
+
+        # Enable model load balancing
+        provider_configuration.enable_model_load_balancing(model=model, model_type=ModelType(model_type))
+
+    def disable_model_load_balancing(self, tenant_id: str, provider: str, model: str, model_type: str):
+        """
+        disable model load balancing.
+
+        :param tenant_id: workspace id
+        :param provider: provider name
+        :param model: model name
+        :param model_type: model type
+        :return:
+        """
+        # Get all provider configurations of the current workspace
+        provider_configurations = self._get_provider_manager(tenant_id).get_configurations(tenant_id)
+
+        # Get provider configuration
+        provider_configuration = provider_configurations.get(provider)
+        if not provider_configuration:
+            raise ValueError(f"Provider {provider} does not exist.")
+
+        # disable model load balancing
+        provider_configuration.disable_model_load_balancing(model=model, model_type=ModelType(model_type))
+
+    def get_load_balancing_configs(
+        self,
+        tenant_id: str,
+        provider: str,
+        model: str,
+        model_type: str,
+        session: Session,
+        config_from: str = "",
+    ) -> tuple[bool, list[LoadBalancingConfigSummaryDict]]:
+        """
+        Get load balancing configurations.
+        :param tenant_id: workspace id
+        :param provider: provider name
+        :param model: model name
+        :param model_type: model type
+        :return:
+        """
+        # Get all provider configurations of the current workspace
+        provider_configurations = self._get_provider_manager(tenant_id).get_configurations(tenant_id)
+
+        # Get provider configuration
+        provider_configuration = provider_configurations.get(provider)
+        if not provider_configuration:
+            raise ValueError(f"Provider {provider} does not exist.")
+
+        # Convert model type to ModelType
+        model_type_enum = ModelType(model_type)
+
+        # Get provider model setting
+        provider_model_setting = provider_configuration.get_provider_model_setting(
+            model_type=model_type_enum,
+            model=model,
+        )
+
+        is_load_balancing_enabled = False
+        if provider_model_setting and provider_model_setting.load_balancing_enabled:
+            is_load_balancing_enabled = True
+
+        if config_from == "predefined-model":
+            credential_source_type = CredentialSourceType.PROVIDER
+        else:
+            credential_source_type = CredentialSourceType.CUSTOM_MODEL
+
+        # Get load balancing configurations
+        load_balancing_configs = list(
+            session.scalars(
+                select(LoadBalancingModelConfig)
+                .where(
+                    LoadBalancingModelConfig.tenant_id == tenant_id,
+                    LoadBalancingModelConfig.provider_name == provider_configuration.provider.provider,
+                    LoadBalancingModelConfig.model_type == model_type_enum,
+                    LoadBalancingModelConfig.model_name == model,
+                    or_(
+                        LoadBalancingModelConfig.credential_source_type == credential_source_type,
+                        LoadBalancingModelConfig.credential_source_type.is_(None),
+                    ),
+                )
+                .order_by(LoadBalancingModelConfig.created_at)
+            ).all()
+        )
+
+        if provider_configuration.custom_configuration.provider:
+            # check if the inherit configuration exists,
+            # inherit is represented for the provider or model custom credentials
+            inherit_config_exists = False
+            for load_balancing_config in load_balancing_configs:
+                if load_balancing_config.name == "__inherit__":
+                    inherit_config_exists = True
+                    break
+
+            if not inherit_config_exists:
+                # Initialize the inherit configuration
+                inherit_config = self._init_inherit_config(tenant_id, provider, model, model_type_enum, session=session)
+
+                # prepend the inherit configuration
+                load_balancing_configs.insert(0, inherit_config)
+            else:
+                # move the inherit configuration to the first
+                for i, load_balancing_config in enumerate(load_balancing_configs.copy()):
+                    if load_balancing_config.name == "__inherit__":
+                        inherit_config = load_balancing_configs.pop(i)
+                        load_balancing_configs.insert(0, inherit_config)
+
+        # Get credential form schemas from model credential schema or provider credential schema
+        credential_schemas = self._get_credential_schema(provider_configuration)
+
+        # Get decoding context for decrypting credentials
+        decoding_context = encrypter.get_decrypt_decoding(tenant_id)
+
+        # fetch status and ttl for each config
+        datas: list[LoadBalancingConfigSummaryDict] = []
+        for load_balancing_config in load_balancing_configs:
+            in_cooldown, ttl = LBModelManager.get_config_in_cooldown_and_ttl(
+                tenant_id=tenant_id,
+                provider=provider,
+                model=model,
+                model_type=model_type_enum,
+                config_id=load_balancing_config.id,
+            )
+
+            credentials = _decode_encrypted_config(load_balancing_config.encrypted_config)
+
+            # Get provider credential secret variables
+            credential_secret_variables = provider_configuration.extract_secret_variables(
+                credential_schemas.credential_form_schemas
+            )
+
+            # decrypt secret strings; switch booleans are not tokens
+            for variable in credential_secret_variables:
+                token_value = credentials.string_value(variable)
+                if token_value is None:
+                    continue
+                with contextlib.suppress(ValueError):
+                    credentials.set(
+                        variable,
+                        encrypter.decrypt_token_with_decoding(token_value, decoding_context),
+                    )
+
+            revealed = _obfuscated_credentials(
+                provider_configuration,
+                credentials,
+                credential_schemas.credential_form_schemas,
+            )
+
+            datas.append(
+                {
+                    "id": load_balancing_config.id,
+                    "name": load_balancing_config.name,
+                    "credentials": revealed,
+                    "credential_id": load_balancing_config.credential_id,
+                    "enabled": load_balancing_config.enabled,
+                    "in_cooldown": in_cooldown,
+                    "ttl": ttl,
+                }
+            )
+
+        return is_load_balancing_enabled, datas
+
+    def get_load_balancing_config(
+        self,
+        tenant_id: str,
+        provider: str,
+        model: str,
+        model_type: str,
+        config_id: str,
+        session: Session,
+    ) -> LoadBalancingConfigDetailDict | None:
+        """
+        Get load balancing configuration.
+        :param tenant_id: workspace id
+        :param provider: provider name
+        :param model: model name
+        :param model_type: model type
+        :param config_id: load balancing config id
+        :return:
+        """
+        provider_manager = create_plugin_provider_manager(tenant_id=tenant_id)
+        provider_configurations = provider_manager.get_configurations(tenant_id)
+
+        # Get provider configuration
+        provider_configuration = provider_configurations.get(provider)
+        if not provider_configuration:
+            raise ValueError(f"Provider {provider} does not exist.")
+
+        # Convert model type to ModelType
+        model_type_enum = ModelType(model_type)
+
+        # Get load balancing configurations
+        load_balancing_model_config = session.scalar(
+            select(LoadBalancingModelConfig)
+            .where(
+                LoadBalancingModelConfig.tenant_id == tenant_id,
+                LoadBalancingModelConfig.provider_name == provider_configuration.provider.provider,
+                LoadBalancingModelConfig.model_type == model_type_enum,
+                LoadBalancingModelConfig.model_name == model,
+                LoadBalancingModelConfig.id == config_id,
+            )
+            .limit(1)
+        )
+
+        if not load_balancing_model_config:
+            return None
+
+        credentials = _decode_encrypted_config(load_balancing_model_config.encrypted_config)
+
+        # Get credential form schemas from model credential schema or provider credential schema
+        credential_schemas = self._get_credential_schema(provider_configuration)
+
+        revealed = _obfuscated_credentials(
+            provider_configuration,
+            credentials,
+            credential_schemas.credential_form_schemas,
+        )
+
+        result: LoadBalancingConfigDetailDict = {
+            "id": load_balancing_model_config.id,
+            "name": load_balancing_model_config.name,
+            "credentials": revealed,
+            "enabled": load_balancing_model_config.enabled,
+        }
+        return result
+
+    def _init_inherit_config(
+        self,
+        tenant_id: str,
+        provider: str,
+        model: str,
+        model_type: ModelType,
+        session: Session,
+    ) -> LoadBalancingModelConfig:
+        """
+        Initialize the inherit configuration.
+        :param tenant_id: workspace id
+        :param provider: provider name
+        :param model: model name
+        :param model_type: model type
+        :return:
+        """
+        # Initialize the inherit configuration
+        inherit_config = LoadBalancingModelConfig(
+            tenant_id=tenant_id,
+            provider_name=provider,
+            model_type=model_type,
+            model_name=model,
+            name="__inherit__",
+        )
+        session.add(inherit_config)
+        session.commit()
+        ProviderManager.invalidate_configurations_cache(
+            tenant_id,
+            sources=(ProviderConfigurationCacheSource.PROVIDER_LOAD_BALANCING_CONFIGS,),
+        )
+
+        return inherit_config
+
+    def update_load_balancing_configs(
+        self,
+        tenant_id: str,
+        provider: str,
+        model: str,
+        model_type: str,
+        configs: list[dict],
+        config_from: str,
+        session: Session,
+        token_cipher: LoadBalancingTokenCipher = _DEFAULT_TOKEN_CIPHER,
+    ):
+        """
+        Update load balancing configurations.
+        :param tenant_id: workspace id
+        :param provider: provider name
+        :param model: model name
+        :param model_type: model type
+        :param configs: load balancing configs
+        :param config_from: predefined-model or custom-model
+        :return:
+        """
+        # Get all provider configurations of the current workspace
+        provider_configurations = self._get_provider_manager(tenant_id).get_configurations(tenant_id)
+
+        # Get provider configuration
+        provider_configuration = provider_configurations.get(provider)
+        if not provider_configuration:
+            raise ValueError(f"Provider {provider} does not exist.")
+
+        # Convert model type to ModelType
+        model_type_enum = ModelType(model_type)
+
+        if not isinstance(configs, list):
+            raise ValueError("Invalid load balancing configs")
+
+        current_load_balancing_configs = session.scalars(
+            select(LoadBalancingModelConfig).where(
+                LoadBalancingModelConfig.tenant_id == tenant_id,
+                LoadBalancingModelConfig.provider_name == provider_configuration.provider.provider,
+                LoadBalancingModelConfig.model_type == model_type_enum,
+                LoadBalancingModelConfig.model_name == model,
+            )
+        ).all()
+
+        # id as key, config as value
+        current_load_balancing_configs_dict = {config.id: config for config in current_load_balancing_configs}
+        updated_config_ids = set()
+
+        for config in configs:
+            if not isinstance(config, dict):
+                raise ValueError("Invalid load balancing config")
+
+            config_id = config.get("id")
+            name = config.get("name")
+            credentials = config.get("credentials")
+            credential_id = config.get("credential_id")
+            enabled = config.get("enabled")
+
+            credential_record: ProviderCredential | ProviderModelCredential | None = None
+
+            if credential_id:
+                if config_from == "predefined-model":
+                    credential_record = session.scalar(
+                        select(ProviderCredential)
+                        .where(
+                            ProviderCredential.id == credential_id,
+                            ProviderCredential.tenant_id == tenant_id,
+                            ProviderCredential.provider_name == provider_configuration.provider.provider,
+                        )
+                        .limit(1)
+                    )
+                else:
+                    credential_record = session.scalar(
+                        select(ProviderModelCredential)
+                        .where(
+                            ProviderModelCredential.id == credential_id,
+                            ProviderModelCredential.tenant_id == tenant_id,
+                            ProviderModelCredential.provider_name == provider_configuration.provider.provider,
+                            ProviderModelCredential.model_name == model,
+                            ProviderModelCredential.model_type == model_type_enum,
+                        )
+                        .limit(1)
+                    )
+                if not credential_record:
+                    raise ValueError(f"Provider credential with id {credential_id} not found")
+                name = credential_record.credential_name
+
+            if not name:
+                raise ValueError("Invalid load balancing config name")
+
+            if enabled is None:
+                raise ValueError("Invalid load balancing config enabled")
+
+            # is config exists
+            if config_id:
+                config_id = str(config_id)
+
+                if config_id not in current_load_balancing_configs_dict:
+                    raise ValueError(f"Invalid load balancing config id: {config_id}")
+
+                updated_config_ids.add(config_id)
+
+                load_balancing_config = current_load_balancing_configs_dict[config_id]
+
+                parsed_credentials = _parse_submitted_credentials(credentials) if credentials else None
+                if parsed_credentials is not None and parsed_credentials.root:
+                    # validate custom provider config
+                    parsed_credentials = self._custom_credentials_validate(
+                        tenant_id=tenant_id,
+                        provider_configuration=provider_configuration,
+                        model_type=model_type_enum,
+                        model=model,
+                        credentials=parsed_credentials,
+                        load_balancing_model_config=load_balancing_config,
+                        validate=False,
+                        token_cipher=token_cipher,
+                    )
+
+                    # update load balancing config
+                    load_balancing_config.encrypted_config = parsed_credentials.model_dump_json()
+
+                load_balancing_config.name = name
+                load_balancing_config.enabled = enabled
+                load_balancing_config.updated_at = naive_utc_now()
+                session.commit()
+                ProviderManager.invalidate_configurations_cache(
+                    tenant_id,
+                    sources=(ProviderConfigurationCacheSource.PROVIDER_LOAD_BALANCING_CONFIGS,),
+                )
+
+                self._clear_credentials_cache(tenant_id, config_id)
+            else:
+                # create load balancing config
+                if name == "__inherit__":
+                    raise ValueError("Invalid load balancing config name")
+
+                if credential_id:
+                    credential_source = (
+                        CredentialSourceType.PROVIDER
+                        if config_from == "predefined-model"
+                        else CredentialSourceType.CUSTOM_MODEL
+                    )
+                    assert credential_record is not None
+                    load_balancing_model_config = LoadBalancingModelConfig(
+                        tenant_id=tenant_id,
+                        provider_name=provider_configuration.provider.provider,
+                        model_type=model_type_enum,
+                        model_name=model,
+                        name=credential_record.credential_name,
+                        encrypted_config=credential_record.encrypted_config,
+                        credential_id=credential_id,
+                        credential_source_type=credential_source,
+                    )
+                else:
+                    parsed_credentials = _parse_submitted_credentials(credentials) if credentials else None
+                    if parsed_credentials is None or not parsed_credentials.root:
+                        raise ValueError("Invalid load balancing config credentials")
+
+                    # validate custom provider config
+                    parsed_credentials = self._custom_credentials_validate(
+                        tenant_id=tenant_id,
+                        provider_configuration=provider_configuration,
+                        model_type=model_type_enum,
+                        model=model,
+                        credentials=parsed_credentials,
+                        validate=False,
+                        token_cipher=token_cipher,
+                    )
+
+                    # create load balancing config
+                    load_balancing_model_config = LoadBalancingModelConfig(
+                        tenant_id=tenant_id,
+                        provider_name=provider_configuration.provider.provider,
+                        model_type=model_type_enum,
+                        model_name=model,
+                        name=name,
+                        encrypted_config=parsed_credentials.model_dump_json(),
+                    )
+
+                session.add(load_balancing_model_config)
+                session.commit()
+                ProviderManager.invalidate_configurations_cache(
+                    tenant_id,
+                    sources=(ProviderConfigurationCacheSource.PROVIDER_LOAD_BALANCING_CONFIGS,),
+                )
+
+        # get deleted config ids
+        deleted_config_ids = set(current_load_balancing_configs_dict.keys()) - updated_config_ids
+        for config_id in deleted_config_ids:
+            session.delete(current_load_balancing_configs_dict[config_id])
+            session.commit()
+            ProviderManager.invalidate_configurations_cache(
+                tenant_id,
+                sources=(ProviderConfigurationCacheSource.PROVIDER_LOAD_BALANCING_CONFIGS,),
+            )
+
+            self._clear_credentials_cache(tenant_id, config_id)
+
+    def validate_load_balancing_credentials(
+        self,
+        tenant_id: str,
+        provider: str,
+        model: str,
+        model_type: str,
+        credentials: LoadBalancingCredentialInput,
+        session: Session,
+        config_id: str | None = None,
+        token_cipher: LoadBalancingTokenCipher = _DEFAULT_TOKEN_CIPHER,
+        model_assembly: PluginModelAssembly | None = None,
+    ):
+        """
+        Validate load balancing credentials.
+        :param tenant_id: workspace id
+        :param provider: provider name
+        :param model_type: model type
+        :param model: model name
+        :param credentials: credentials
+        :param config_id: load balancing config id
+        :return:
+        """
+        assembly = model_assembly if model_assembly is not None else create_plugin_model_assembly(tenant_id=tenant_id)
+        provider_configurations = assembly.provider_manager.get_configurations(tenant_id)
+
+        # Get provider configuration
+        provider_configuration = provider_configurations.get(provider)
+        if not provider_configuration:
+            raise ValueError(f"Provider {provider} does not exist.")
+
+        # Convert model type to ModelType
+        model_type_enum = ModelType(model_type)
+
+        load_balancing_model_config = None
+        if config_id:
+            # Get load balancing config
+            load_balancing_model_config = session.scalar(
+                select(LoadBalancingModelConfig)
+                .where(
+                    LoadBalancingModelConfig.tenant_id == tenant_id,
+                    LoadBalancingModelConfig.provider_name == provider,
+                    LoadBalancingModelConfig.model_type == model_type_enum,
+                    LoadBalancingModelConfig.model_name == model,
+                    LoadBalancingModelConfig.id == config_id,
+                )
+                .limit(1)
+            )
+
+            if not load_balancing_model_config:
+                raise ValueError(f"Load balancing config {config_id} does not exist.")
+
+        # Validate custom provider config
+        self._custom_credentials_validate(
+            tenant_id=tenant_id,
+            provider_configuration=provider_configuration,
+            model_type=model_type_enum,
+            model=model,
+            credentials=_parse_submitted_credentials(credentials),
+            load_balancing_model_config=load_balancing_model_config,
+            model_provider_factory=assembly.model_provider_factory,
+            token_cipher=token_cipher,
+        )
+
+    def _custom_credentials_validate(
+        self,
+        tenant_id: str,
+        provider_configuration: ProviderConfiguration,
+        model_type: ModelType,
+        model: str,
+        credentials: LoadBalancingCredentials,
+        load_balancing_model_config: LoadBalancingModelConfig | None = None,
+        model_provider_factory: ModelProviderFactory | None = None,
+        validate: bool = True,
+        token_cipher: LoadBalancingTokenCipher = _DEFAULT_TOKEN_CIPHER,
+    ) -> LoadBalancingCredentials:
+        """
+        Validate custom credentials.
+        :param tenant_id: workspace id
+        :param provider_configuration: provider configuration
+        :param model_type: model type
+        :param model: model name
+        :param credentials: credentials
+        :param load_balancing_model_config: load balancing model config
+        :param model_provider_factory: model provider factory sharing the active runtime
+        :param validate: validate credentials
+        :return:
+        """
+        # Get credential form schemas from model credential schema or provider credential schema
+        credential_schemas = self._get_credential_schema(provider_configuration)
+
+        # Get provider credential secret variables
+        provider_credential_secret_variables = provider_configuration.extract_secret_variables(
+            credential_schemas.credential_form_schemas
+        )
+
+        credentials = LoadBalancingCredentials.model_validate(dict(credentials.root))
+
+        if load_balancing_model_config:
+            # fix origin data
+            original_credentials = _decode_encrypted_config(load_balancing_model_config.encrypted_config)
+
+            for key, value in credentials.root.items():
+                if key not in provider_credential_secret_variables or value != HIDDEN_VALUE:
+                    continue
+                # A hidden secret is replaced with the previously stored token.
+                original = original_credentials.string_value(key)
+                if original is None:
+                    continue
+                credentials.set(key, token_cipher.decrypt_token(tenant_id, original))
+
+        if validate:
+            assert model_provider_factory is not None
+            if isinstance(credential_schemas, ModelCredentialSchema):
+                validated = model_provider_factory.model_credentials_validate(
+                    provider=provider_configuration.provider.provider,
+                    model_type=model_type,
+                    model=model,
+                    credentials=credentials.root,
+                )
+            else:
+                validated = model_provider_factory.provider_credentials_validate(
+                    provider=provider_configuration.provider.provider,
+                    credentials=credentials.root,
+                )
+            credentials = LoadBalancingCredentials.model_validate(validated)
+
+        for key in provider_credential_secret_variables:
+            token = credentials.string_value(key)
+            if token is None:
+                continue
+            credentials.set(key, token_cipher.encrypt_token(tenant_id, token))
+
+        return credentials
+
+    def _get_credential_schema(
+        self, provider_configuration: ProviderConfiguration
+    ) -> ModelCredentialSchema | ProviderCredentialSchema:
+        """Get form schemas."""
+        if provider_configuration.provider.model_credential_schema:
+            return provider_configuration.provider.model_credential_schema
+        elif provider_configuration.provider.provider_credential_schema:
+            return provider_configuration.provider.provider_credential_schema
+        else:
+            raise ValueError("No credential schema found")
+
+    def _clear_credentials_cache(self, tenant_id: str, config_id: str):
+        """
+        Clear credentials cache.
+        :param tenant_id: workspace id
+        :param config_id: load balancing config id
+        :return:
+        """
+        provider_model_credentials_cache = ProviderCredentialsCache(
+            tenant_id=tenant_id, identity_id=config_id, cache_type=ProviderCredentialsCacheType.LOAD_BALANCING_MODEL
+        )
+
+        provider_model_credentials_cache.delete()
